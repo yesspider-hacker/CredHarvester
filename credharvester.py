@@ -46,7 +46,10 @@ class MEMORY_BASIC_INFORMATION(ctypes.Structure):
 
 # ================== Regex Patterns ==================
 PATTERNS = {
-    "password": re.compile(r"(password\s*=\s*[^\s'\";]+)", re.IGNORECASE),
+    "password_eq": re.compile(r"(password\s*=\s*[^\s'\";]+)", re.IGNORECASE),
+    "pwd_eq": re.compile(r"(pwd\s*=\s*[^\s'\";]+)", re.IGNORECASE),
+    "login_eq": re.compile(r"(login\s*=\s*[^\s'\";]+)", re.IGNORECASE),
+    "user_pass_colon": re.compile(r"([A-Za-z0-9._-]+:[^\s:@]{4,})"),
     "aws_key": re.compile(r"AKIA[0-9A-Z]{16}"),
     "github_token": re.compile(r"ghp_[0-9a-zA-Z]{36}"),
     "jwt": re.compile(r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"),
@@ -79,21 +82,34 @@ def scan_process_memory(pid=None, verbose=False):
 
             mbi = MEMORY_BASIC_INFORMATION()
             addr = 0
-            max_addr = 0x7FFFFFFF if os.name == "nt" else 0xFFFFFFFFFFFF  # 32-bit safe cap
+            max_addr = 0x7FFFFFFFFFFF  # 64-bit userland
+
+            regions_scanned = 0
+            creds_found = 0
 
             while addr < max_addr and VirtualQueryEx(handle, ctypes.c_void_p(addr), ctypes.byref(mbi), ctypes.sizeof(mbi)):
                 region_size = int(mbi.RegionSize)
 
-                # Skip huge/unusable regions
-                if mbi.State == 0x1000 and region_size < 10 * 1024 * 1024:  # only scan committed < 10MB
-                    buf = ctypes.create_string_buffer(region_size)
+                if mbi.State == 0x1000 and region_size > 0:  # MEM_COMMIT
+                    read_size = min(region_size, 1024 * 1024)  # read up to 1MB
+                    buf = ctypes.create_string_buffer(read_size)
                     bytesRead = ctypes.c_size_t(0)
 
-                    if ReadProcessMemory(handle, mbi.BaseAddress, buf, region_size, ctypes.byref(bytesRead)):
-                        try:
-                            text = buf.raw.decode("latin-1", errors="ignore")
+                    if ReadProcessMemory(handle, mbi.BaseAddress, buf, read_size, ctypes.byref(bytesRead)):
+                        raw = buf.raw
+
+                        # Try multiple decodings
+                        candidates = []
+                        for enc in ["latin-1", "utf-16-le", "utf-8"]:
+                            try:
+                                candidates.append(raw.decode(enc, errors="ignore"))
+                            except:
+                                pass
+
+                        for text in candidates:
                             for label, pattern in PATTERNS.items():
                                 for match in pattern.findall(text):
+                                    creds_found += 1
                                     findings.append({
                                         "type": "process_memory",
                                         "pid": proc.pid,
@@ -101,14 +117,12 @@ def scan_process_memory(pid=None, verbose=False):
                                         "pattern": label,
                                         "match": match
                                     })
-                        except Exception:
-                            pass
 
-                # Verbose region trace
                 if verbose:
-                    print(f"    [+] Region at {hex(addr)} size {region_size} scanned")
+                    print(f"    [+] Region {regions_scanned} at {hex(addr)} size {region_size} scanned, creds found: {creds_found}")
 
-                addr += region_size if region_size else 0x1000  # move to next page
+                addr += region_size if region_size else 0x1000
+                regions_scanned += 1
 
             CloseHandle(handle)
 
@@ -116,7 +130,6 @@ def scan_process_memory(pid=None, verbose=False):
             if verbose:
                 print(Fore.RED + f"[!] Error scanning PID {proc.pid}: {e}")
             continue
-
     return findings
 
 # ================== Env Var Scanner ==================
@@ -143,7 +156,7 @@ def scan_registry():
     }
 
     interesting_keys = [
-        r"Software\Microsoft\Terminal Server Client",  # RDP history
+        r"Software\Microsoft\Terminal Server Client",
         r"Software\OpenVPN",
         r"Software\MyApp"
     ]

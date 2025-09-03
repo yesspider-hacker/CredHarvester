@@ -13,7 +13,6 @@ init(autoreset=True)
 # ================== Windows API ==================
 PROCESS_QUERY_INFORMATION = 0x0400
 PROCESS_VM_READ = 0x0010
-PROCESS_ALL_ACCESS = 0x1F0FFF
 
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
@@ -56,7 +55,7 @@ PATTERNS = {
 }
 
 # ================== Process Memory Scanner ==================
-def scan_process_memory(pid=None):
+def scan_process_memory(pid=None, verbose=False):
     findings = []
     procs = []
 
@@ -75,13 +74,22 @@ def scan_process_memory(pid=None):
             if not handle:
                 continue
 
+            if verbose:
+                print(Fore.BLUE + f"[*] Scanning PID {proc.pid} ({proc.name()})")
+
             mbi = MEMORY_BASIC_INFORMATION()
             addr = 0
-            while VirtualQueryEx(handle, ctypes.c_void_p(addr), ctypes.byref(mbi), ctypes.sizeof(mbi)):
-                if mbi.State == 0x1000 and (mbi.Protect & 0x04 or mbi.Protect & 0x20 or mbi.Protect & 0x40):  
-                    buf = ctypes.create_string_buffer(mbi.RegionSize)
+            max_addr = 0x7FFFFFFF if os.name == "nt" else 0xFFFFFFFFFFFF  # 32-bit safe cap
+
+            while addr < max_addr and VirtualQueryEx(handle, ctypes.c_void_p(addr), ctypes.byref(mbi), ctypes.sizeof(mbi)):
+                region_size = int(mbi.RegionSize)
+
+                # Skip huge/unusable regions
+                if mbi.State == 0x1000 and region_size < 10 * 1024 * 1024:  # only scan committed < 10MB
+                    buf = ctypes.create_string_buffer(region_size)
                     bytesRead = ctypes.c_size_t(0)
-                    if ReadProcessMemory(handle, mbi.BaseAddress, buf, mbi.RegionSize, ctypes.byref(bytesRead)):
+
+                    if ReadProcessMemory(handle, mbi.BaseAddress, buf, region_size, ctypes.byref(bytesRead)):
                         try:
                             text = buf.raw.decode("latin-1", errors="ignore")
                             for label, pattern in PATTERNS.items():
@@ -95,14 +103,23 @@ def scan_process_memory(pid=None):
                                     })
                         except Exception:
                             pass
-                addr += mbi.RegionSize
+
+                # Verbose region trace
+                if verbose:
+                    print(f"    [+] Region at {hex(addr)} size {region_size} scanned")
+
+                addr += region_size if region_size else 0x1000  # move to next page
+
             CloseHandle(handle)
 
-        except Exception:
+        except Exception as e:
+            if verbose:
+                print(Fore.RED + f"[!] Error scanning PID {proc.pid}: {e}")
             continue
+
     return findings
 
-# ================== Env Variable Scanner ==================
+# ================== Env Var Scanner ==================
 def scan_env():
     findings = []
     envs = os.environ.copy()
@@ -126,9 +143,9 @@ def scan_registry():
     }
 
     interesting_keys = [
-        r"Software\Microsoft\Terminal Server Client",  # RDP creds
-        r"Software\OpenVPN",                          # VPN creds
-        r"Software\MyApp"                             # placeholder for testing
+        r"Software\Microsoft\Terminal Server Client",  # RDP history
+        r"Software\OpenVPN",
+        r"Software\MyApp"
     ]
 
     for hive_name, hive in hives.items():
@@ -156,7 +173,7 @@ def scan_registry():
                 continue
     return findings
 
-# ================== Pretty Output ==================
+# ================== Pretty Print ==================
 def pretty_print(results):
     print(Fore.CYAN + Style.BRIGHT + "\n[+] CredHarvester++ Results")
     print(Fore.CYAN + "---------------------------------------------")
@@ -184,6 +201,7 @@ if __name__ == "__main__":
     parser.add_argument("--registry", action="store_true", help="Scan registry keys")
     parser.add_argument("--all", action="store_true", help="Run all modules")
     parser.add_argument("--pid", type=int, help="Scan specific process ID")
+    parser.add_argument("--verbose", action="store_true", help="Enable verbose mode")
     args = parser.parse_args()
 
     results = []
@@ -193,7 +211,7 @@ if __name__ == "__main__":
             print(Fore.BLUE + f"[*] Scanning memory of PID {args.pid}...")
         else:
             print(Fore.BLUE + "[*] Scanning memory of all processes...")
-        results.extend(scan_process_memory(args.pid))
+        results.extend(scan_process_memory(args.pid, args.verbose))
 
     if args.env or args.all:
         print(Fore.BLUE + "[*] Scanning environment variables...")

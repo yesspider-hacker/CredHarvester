@@ -6,7 +6,7 @@ import os
 import argparse
 from colorama import Fore, Style, init
 
-# Initialize colorama for colorful output
+# Initialize colorama
 init(autoreset=True)
 
 # ================== Windows API ==================
@@ -37,19 +37,30 @@ PATTERNS = {
     "jwt": re.compile(r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+")
 }
 
-# ================== Process Memory Scanner (simplified PoC) ==================
-def scan_process_memory(max_read=4096*10):
+# ================== Process Memory Scanner ==================
+def scan_process_memory(pid=None, max_read=4096*10):
     findings = []
-    for proc in psutil.process_iter(attrs=["pid", "name"]):
+    procs = []
+
+    if pid:
         try:
-            handle = OpenProcess(PROCESS_ALL_ACCESS, False, proc.info["pid"])
+            procs = [psutil.Process(pid)]
+        except psutil.NoSuchProcess:
+            print(Fore.RED + f"[-] No process found with PID {pid}")
+            return findings
+    else:
+        procs = psutil.process_iter(attrs=["pid", "name"])
+
+    for proc in procs:
+        try:
+            handle = OpenProcess(PROCESS_ALL_ACCESS, False, proc.pid)
             if not handle:
                 continue
 
             buf = ctypes.create_string_buffer(max_read)
             bytesRead = ctypes.c_size_t(0)
 
-            # Fixed base address for PoC (real tool would walk memory regions)
+            # NOTE: Fixed base address for PoC. Full tool should walk memory regions.
             if ReadProcessMemory(handle, ctypes.c_void_p(0x0000000140000000),
                                  buf, max_read, ctypes.byref(bytesRead)):
                 text = buf.raw.decode("latin-1", errors="ignore")
@@ -57,8 +68,8 @@ def scan_process_memory(max_read=4096*10):
                     for match in pattern.findall(text):
                         findings.append({
                             "type": "process_memory",
-                            "pid": proc.info["pid"],
-                            "process": proc.info["name"],
+                            "pid": proc.pid,
+                            "process": proc.name(),
                             "pattern": label,
                             "match": match
                         })
@@ -105,13 +116,17 @@ if __name__ == "__main__":
     parser.add_argument("--process", action="store_true", help="Scan process memory")
     parser.add_argument("--env", action="store_true", help="Scan environment variables")
     parser.add_argument("--all", action="store_true", help="Run all modules")
+    parser.add_argument("--pid", type=int, help="Scan specific process ID")
     args = parser.parse_args()
 
     results = []
 
     if args.process or args.all:
-        print(Fore.BLUE + "[*] Scanning process memory...")
-        results.extend(scan_process_memory())
+        if args.pid:
+            print(Fore.BLUE + f"[*] Scanning memory of PID {args.pid}...")
+        else:
+            print(Fore.BLUE + "[*] Scanning memory of all processes...")
+        results.extend(scan_process_memory(args.pid))
 
     if args.env or args.all:
         print(Fore.BLUE + "[*] Scanning environment variables...")
